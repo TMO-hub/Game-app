@@ -1,7 +1,8 @@
-import io
+from io import BytesIO
 import re
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from gtts import gTTS
@@ -450,10 +451,10 @@ SCENARIOS = [
 
 
 # -----------------------------------------------------------------------------
-# Font & Visual Helpers (Safe Across Pillow Versions)
+# PIL Font & Scenario Banner Helpers
 # -----------------------------------------------------------------------------
-def load_font(size: int) -> ImageFont.ImageFont:
-    """Safely loads a default PIL font with requested size across Pillow 10+ and older versions."""
+def get_font(size: int) -> ImageFont.ImageFont:
+    """Safely loads a default PIL font of the given size across Pillow versions."""
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -482,9 +483,9 @@ def generate_scenario_banner(
     draw.ellipse([71, 59, 79, 67], fill="#ffffff")
     draw.ellipse([88, 59, 96, 67], fill="#ffffff")
 
-    title_font = load_font(28)
-    sub_font = load_font(17)
-    badge_font = load_font(15)
+    title_font = get_font(28)
+    sub_font = get_font(17)
+    badge_font = get_font(15)
 
     trimmed_setting = setting[:72] + ("..." if len(setting) > 72 else "")
     draw.text((138, 30), title, fill="#111827", font=title_font)
@@ -496,27 +497,83 @@ def generate_scenario_banner(
         font=badge_font,
     )
 
-    buf = io.BytesIO()
+    buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
 # -----------------------------------------------------------------------------
-# Audio Pronunciation Helper (Safe gTTS Wrapper)
+# Reliable Audio Helper (gTTS + Explicit Diagnostics + Browser Speech Fallback)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def text_to_speech_bytes(text: str) -> bytes | None:
-    """Generates MP3 audio bytes via gTTS, returning None cleanly if unavailable or offline."""
-    if not GTTS_AVAILABLE or not text.strip():
-        return None
+def text_to_mp3_bytes(text: str, lang: str = "en") -> tuple[bytes | None, str | None]:
+    """
+    Converts stripped text to MP3 bytes via gTTS.
+    Returns (mp3_bytes, error_reason). Never silently swallows errors.
+    """
+    cleaned = text.strip() if isinstance(text, str) else ""
+    if not cleaned:
+        return None, "Empty text provided to text-to-speech."
+    if not GTTS_AVAILABLE:
+        return None, "`gTTS` is not installed in this Python environment (`pip install gTTS`)."
+
     try:
-        tts = gTTS(text=text, lang="en", slow=False)
-        buf = io.BytesIO()
+        tts = gTTS(text=cleaned, lang=lang, slow=False)
+        buf = BytesIO()
         tts.write_to_fp(buf)
-        buf.seek(0)
-        return buf.read()
-    except Exception:
-        return None
+        mp3_data = buf.getvalue()
+        if not mp3_data:
+            return None, "`gTTS` returned empty audio data."
+        return mp3_data, None
+    except Exception as exc:
+        return None, f"`gTTS` error ({type(exc).__name__}): {exc}"
+
+
+def render_browser_speech_fallback(text: str, button_label: str, widget_key: str) -> None:
+    """Renders a browser Web Speech API (`window.speechSynthesis`) fallback button."""
+    safe_text = text.strip().replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
+    safe_label = button_label.replace("<", "&lt;").replace(">", "&gt;")
+    html = f"""
+    <div style="margin: 0.25rem 0 0.5rem 0;">
+        <button id="btn_{widget_key}" type="button"
+            style="background:#f1f5f9;color:#0f172a;border:1px solid #cbd5e1;
+                   border-radius:0.5rem;padding:0.35rem 0.75rem;font-size:0.875rem;
+                   cursor:pointer;">
+            🌐 {safe_label}
+        </button>
+    </div>
+    <script>
+    (function() {{
+        const btn = document.getElementById("btn_{widget_key}");
+        if (!btn) return;
+        btn.onclick = function() {{
+            if (!("speechSynthesis" in window)) {{
+                btn.textContent = "Browser speechSynthesis unsupported";
+                return;
+            }}
+            window.speechSynthesis.cancel();
+            const utter = new SpeechSynthesisUtterance("{safe_text}");
+            utter.lang = "en-US";
+            window.speechSynthesis.speak(utter);
+        }};
+    }})();
+    </script>
+    """
+    components.html(html, height=44)
+
+
+def render_pronunciation_controls(text: str, mp3_label: str, key_prefix: str) -> None:
+    """Plays gTTS audio if available; otherwise shows exact error diagnostic + browser fallback."""
+    mp3_bytes, err_reason = text_to_mp3_bytes(text, lang="en")
+    if mp3_bytes:
+        st.audio(mp3_bytes, format="audio/mp3", autoplay=True)
+    else:
+        st.warning(f"Audio fallback active — {err_reason}")
+        render_browser_speech_fallback(
+            text=text,
+            button_label=f"Speak in Browser ({mp3_label})",
+            widget_key=key_prefix,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -584,6 +641,8 @@ def reset_scenario(scenario_id: str, mode: str):
     st.session_state.show_hint = False
     st.session_state.turn_answered = False
     st.session_state.last_feedback = None
+    st.session_state.play_a_audio = False
+    st.session_state.play_ideal_audio = False
 
 
 if "scenario_id" not in st.session_state:
@@ -637,9 +696,9 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "🎧 **Audio:** Uses `gTTS` when online; automatically falls back if offline."
+        "🎧 **Audio:** `gTTS` MP3 synthesis with diagnostic & browser speech fallback."
         if GTTS_AVAILABLE
-        else "🎧 **Audio:** Install `gTTS` for voice playback."
+        else "🎧 **Audio:** `gTTS` not installed; browser `speechSynthesis` fallback active."
     )
 
 
@@ -716,11 +775,14 @@ if not st.session_state.turn_answered:
     with st.chat_message("assistant", avatar=scenario["person_a_avatar"]):
         st.markdown(f"**{scenario['person_a_role']}:** {current_turn['speaker_a']}")
         if st.button("🔊 Listen", key=f"listen_a_{scenario['id']}_{turn_idx}"):
-            audio_a = text_to_speech_bytes(current_turn["speaker_a"])
-            if audio_a:
-                st.audio(audio_a, format="audio/mp3", autoplay=True)
-            else:
-                st.info("🔇 Audio unavailable right now. Read the line aloud to practice!")
+            st.session_state.play_a_audio = True
+
+        if st.session_state.play_a_audio:
+            render_pronunciation_controls(
+                text=current_turn["speaker_a"],
+                mp3_label="Person A",
+                key_prefix=f"sp_a_{scenario['id']}_{turn_idx}",
+            )
 
     h_col1, h_col2 = st.columns([1, 2])
     with h_col1:
@@ -768,6 +830,7 @@ if not st.session_state.turn_answered:
             st.session_state.chat_history.append({"role": "A", "text": current_turn["speaker_a"]})
             st.session_state.chat_history.append({"role": "B", "text": selected_text})
             st.session_state.turn_answered = True
+            st.session_state.play_a_audio = False
             st.session_state.last_feedback = {"status": opt_type, "msg": msg}
             st.rerun()
 
@@ -796,6 +859,7 @@ if not st.session_state.turn_answered:
                 st.session_state.chat_history.append({"role": "A", "text": current_turn["speaker_a"]})
                 st.session_state.chat_history.append({"role": "B", "text": typed_reply.strip()})
                 st.session_state.turn_answered = True
+                st.session_state.play_a_audio = False
                 st.session_state.last_feedback = {
                     "status": rating,
                     "msg": f"{eval_msg} **(+{earned} pts)**",
@@ -817,12 +881,15 @@ if st.session_state.turn_answered and st.session_state.last_feedback:
     ideal_line = current_turn["ideal_response"]
     st.markdown(f"**✨ Model Natural Response:** *\"{ideal_line}\"*")
 
-    if st.button("🔊 Listen to Model Response", key=f"listen_ideal_{scenario['id']}_{turn_idx}"):
-        audio_ideal = text_to_speech_bytes(ideal_line)
-        if audio_ideal:
-            st.audio(audio_ideal, format="audio/mp3", autoplay=True)
-        else:
-            st.info("🔇 Audio unavailable right now. Practice reading the model response aloud!")
+    if st.button("🔊 Listen", key=f"listen_ideal_{scenario['id']}_{turn_idx}"):
+        st.session_state.play_ideal_audio = True
+
+    if st.session_state.play_ideal_audio:
+        render_pronunciation_controls(
+            text=ideal_line,
+            mp3_label="Model Response",
+            key_prefix=f"sp_ideal_{scenario['id']}_{turn_idx}",
+        )
 
     alts_html = "".join(
         f"<span class='alt-pill'>“{alt}”</span>" for alt in current_turn["alternatives"][:2]
@@ -845,4 +912,6 @@ if st.session_state.turn_answered and st.session_state.last_feedback:
         st.session_state.turn_answered = False
         st.session_state.show_hint = False
         st.session_state.last_feedback = None
+        st.session_state.play_a_audio = False
+        st.session_state.play_ideal_audio = False
         st.rerun()
