@@ -875,3 +875,4 @@ if st.session_state.turn_answered and st.session_state.last_feedback:
         st.session_state.show_hint = False
         st.session_state.last_feedback = None
         st.rerun()
+from PIL import Image, ImageDraw, ImageFont
