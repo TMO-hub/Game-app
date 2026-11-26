@@ -1,5 +1,5 @@
-pip install streamlit pillow
-streamlit run app.py
 streamlit
-pillow>=10.0.0
+Pillow>=10.0.0
 gTTS
+pip install -r requirements.txt
+streamlit run app.py
